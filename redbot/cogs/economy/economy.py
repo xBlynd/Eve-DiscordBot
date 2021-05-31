@@ -1,7 +1,7 @@
 import calendar
 import logging
 import random
-from collections import defaultdict, deque, namedtuple
+from collections import defaultdict, deque
 from enum import Enum
 from math import ceil
 from typing import cast, Iterable, Union, Literal
@@ -11,12 +11,16 @@ import discord
 from redbot.cogs.bank import is_owner_if_bank_global
 from redbot.cogs.mod.converters import RawUserIds
 from redbot.core import Config, bank, commands, errors, checks
+from redbot.core.commands.converter import TimedeltaConverter
 from redbot.core.bot import Red
 from redbot.core.i18n import Translator, cog_i18n
 from redbot.core.utils import AsyncIter
 from redbot.core.utils.chat_formatting import box, humanize_number
-from redbot.core.utils.menus import close_menu, menu, DEFAULT_CONTROLS
+from redbot.core.bot import Red
+from redbot.core.utils._dpy_menus_utils import SimpleHybridMenu
+
 from .converters import positive_int
+from .menus import LeaderboardSource
 
 T_ = Translator("Economy", __file__)
 
@@ -24,7 +28,6 @@ logger = logging.getLogger("red.economy")
 
 NUM_ENC = "\N{COMBINING ENCLOSING KEYCAP}"
 VARIATION_SELECTOR = "\N{VARIATION SELECTOR-16}"
-MOCK_MEMBER = namedtuple("Member", "id guild")
 
 
 class SMReel(Enum):
@@ -89,7 +92,7 @@ def guild_only_check():
     async def pred(ctx: commands.Context):
         if await bank.is_global():
             return True
-        elif not await bank.is_global() and ctx.guild is not None:
+        elif ctx.guild is not None and not await bank.is_global():
             return True
         else:
             return False
@@ -100,19 +103,30 @@ def guild_only_check():
 class SetParser:
     def __init__(self, argument):
         allowed = ("+", "-")
-        self.sum = int(argument)
+        try:
+            self.sum = int(argument)
+        except ValueError:
+            raise commands.BadArgument(
+                _(
+                    "Invalid value, the argument must be an integer,"
+                    " optionally preceded with a `+` or `-` sign."
+                )
+            )
         if argument and argument[0] in allowed:
             if self.sum < 0:
                 self.operation = "withdraw"
             elif self.sum > 0:
                 self.operation = "deposit"
             else:
-                raise RuntimeError
+                raise commands.BadArgument(
+                    _(
+                        "Invalid value, the amount of currency to increase or decrease"
+                        " must be an integer different from zero."
+                    )
+                )
             self.sum = abs(self.sum)
-        elif argument.isdigit():
-            self.operation = "set"
         else:
-            raise RuntimeError
+            self.operation = "set"
 
 
 @cog_i18n(_)
@@ -403,8 +417,7 @@ class Economy(commands.Cog):
         - `<user>` The user to delete the bank of. Takes mentions, names, and user ids.
         - `<confirmation>` This will default to false unless specified.
         """
-        global_bank = await bank.is_global()
-        if global_bank is False and ctx.guild is None:
+        if ctx.guild is None and not await bank.is_global():
             return await ctx.send(_("This command cannot be used in DMs with a local bank."))
         try:
             name = member_or_id.display_name
@@ -450,7 +463,7 @@ class Economy(commands.Cog):
                     await bank.set_balance(author, exc.max_balance)
                     await ctx.send(
                         _(
-                            "You've reached the maximum amount of {currency}!"
+                            "You've reached the maximum amount of {currency}! "
                             "Please spend some more \N{GRIMACING FACE}\n\n"
                             "You currently have {new_balance} {currency}."
                         ).format(
@@ -543,123 +556,36 @@ class Economy(commands.Cog):
 
     @commands.command()
     @guild_only_check()
-    async def leaderboard(self, ctx: commands.Context, top: int = 10, show_global: bool = False):
+    async def leaderboard(self, ctx: commands.Context, show_global: bool = False):
         """Print the leaderboard.
 
         Defaults to top 10.
 
         Examples:
-            - `[p]leaderboard`
-            - `[p]leaderboard 50` - Shows the top 50 instead of top 10.
-            - `[p]leaderboard 100 yes` - Shows the top 100 from all servers.
+            - `[p]leaderboard  - Shows members from the current server.
+            - `[p]leaderboard yes` - Shows members from all servers.
 
         **Arguments**
 
-        - `<top>` How many positions on the leaderboard to show. Defaults to 10 if omitted.
         - `<show_global>` Whether to include results from all servers. This will default to false unless specified.
         """
         guild = ctx.guild
-        author = ctx.author
-        embed_requested = await ctx.embed_requested()
-        footer_message = _("Page {page_num}/{page_len}.")
-        max_bal = await bank.get_max_balance(ctx.guild)
-
-        if top < 1:
-            top = 10
-
-        base_embed = discord.Embed(title=_("Economy Leaderboard"))
         if await bank.is_global() and show_global:
             # show_global is only applicable if bank is global
-            bank_sorted = await bank.get_leaderboard(positions=top, guild=None)
-            base_embed.set_author(name=ctx.bot.user.name, icon_url=ctx.bot.user.avatar_url)
+            bank_sorted = await bank.get_leaderboard(guild=None)
         else:
-            bank_sorted = await bank.get_leaderboard(positions=top, guild=guild)
-            if guild:
-                base_embed.set_author(name=guild.name, icon_url=guild.icon_url)
-
+            bank_sorted = await bank.get_leaderboard(guild=guild)
         try:
-            bal_len = len(humanize_number(bank_sorted[0][1]["balance"]))
-            bal_len_max = len(humanize_number(max_bal))
-            if bal_len > bal_len_max:
-                bal_len = bal_len_max
+            bank_sorted[0][1]["balance"]
             # first user is the largest we'll see
         except IndexError:
             return await ctx.send(_("There are no accounts in the bank."))
-        pound_len = len(str(len(bank_sorted)))
-        header = "{pound:{pound_len}}{score:{bal_len}}{name:2}\n".format(
-            pound="#",
-            name=_("Name"),
-            score=_("Score"),
-            bal_len=bal_len + 6,
-            pound_len=pound_len + 3,
-        )
-        highscores = []
-        pos = 1
-        temp_msg = header
-        for acc in bank_sorted:
-            try:
-                name = guild.get_member(acc[0]).display_name
-            except AttributeError:
-                user_id = ""
-                if await ctx.bot.is_owner(ctx.author):
-                    user_id = f"({str(acc[0])})"
-                name = f"{acc[1]['name']} {user_id}"
 
-            balance = acc[1]["balance"]
-            if balance > max_bal:
-                balance = max_bal
-                await bank.set_balance(MOCK_MEMBER(acc[0], guild), balance)
-            balance = humanize_number(balance)
-            if acc[0] != author.id:
-                temp_msg += (
-                    f"{f'{humanize_number(pos)}.': <{pound_len+2}} "
-                    f"{balance: <{bal_len + 5}} {name}\n"
-                )
-
-            else:
-                temp_msg += (
-                    f"{f'{humanize_number(pos)}.': <{pound_len+2}} "
-                    f"{balance: <{bal_len + 5}} "
-                    f"<<{author.display_name}>>\n"
-                )
-            if pos % 10 == 0:
-                if embed_requested:
-                    embed = base_embed.copy()
-                    embed.description = box(temp_msg, lang="md")
-                    embed.set_footer(
-                        text=footer_message.format(
-                            page_num=len(highscores) + 1,
-                            page_len=ceil(len(bank_sorted) / 10),
-                        )
-                    )
-                    highscores.append(embed)
-                else:
-                    highscores.append(box(temp_msg, lang="md"))
-                temp_msg = header
-            pos += 1
-
-        if temp_msg != header:
-            if embed_requested:
-                embed = base_embed.copy()
-                embed.description = box(temp_msg, lang="md")
-                embed.set_footer(
-                    text=footer_message.format(
-                        page_num=len(highscores) + 1,
-                        page_len=ceil(len(bank_sorted) / 10),
-                    )
-                )
-                highscores.append(embed)
-            else:
-                highscores.append(box(temp_msg, lang="md"))
-
-        if highscores:
-            await menu(
-                ctx,
-                highscores,
-                DEFAULT_CONTROLS if len(highscores) > 1 else {"\N{CROSS MARK}": close_menu},
-            )
-        else:
-            await ctx.send(_("No balances found."))
+        await SimpleHybridMenu(
+            source=LeaderboardSource(bank_sorted),
+            cog=self,
+            delete_message_after=True,
+        ).start(ctx=ctx, wait=False)
 
     @commands.command()
     @guild_only_check()
@@ -904,16 +830,21 @@ class Economy(commands.Cog):
         )
 
     @economyset.command()
-    async def slottime(self, ctx: commands.Context, seconds: int):
+    async def slottime(
+        self, ctx: commands.Context, *, duration: TimedeltaConverter(default_unit="seconds")
+    ):
         """Set the cooldown for the slot machine.
 
-        Example:
+        Examples:
             - `[p]economyset slottime 10`
+            - `[p]economyset slottime 10m`
 
         **Arguments**
 
-        - `<seconds>` The new number of seconds to wait in between uses of the slot machine. Default is 5.
+        - `<duration>` The new duration to wait in between uses of the slot machine. Default is 5 seconds.
+        Accepts: seconds, minutes, hours, days, weeks (if no unit is specified, the duration is assumed to be given in seconds)
         """
+        seconds = int(duration.total_seconds())
         guild = ctx.guild
         if await bank.is_global():
             await self.config.SLOT_TIME.set(seconds)
@@ -922,16 +853,21 @@ class Economy(commands.Cog):
         await ctx.send(_("Cooldown is now {num} seconds.").format(num=seconds))
 
     @economyset.command()
-    async def paydaytime(self, ctx: commands.Context, seconds: int):
+    async def paydaytime(
+        self, ctx: commands.Context, *, duration: TimedeltaConverter(default_unit="seconds")
+    ):
         """Set the cooldown for the payday command.
 
-        Example:
+        Examples:
             - `[p]economyset paydaytime 86400`
+            - `[p]economyset paydaytime 1d`
 
         **Arguments**
 
-        - `<seconds>` The new number of seconds to wait in between uses of payday. Default is 300.
+        - `<duration>` The new duration to wait in between uses of payday. Default is 5 minutes.
+        Accepts: seconds, minutes, hours, days, weeks (if no unit is specified, the duration is assumed to be given in seconds)
         """
+        seconds = int(duration.total_seconds())
         guild = ctx.guild
         if await bank.is_global():
             await self.config.PAYDAY_TIME.set(seconds)
@@ -976,6 +912,7 @@ class Economy(commands.Cog):
     @economyset.command()
     async def rolepaydayamount(self, ctx: commands.Context, role: discord.Role, creds: int):
         """Set the amount earned each payday for a role.
+        Set to `0` to remove the payday amount you set for that role.
 
         Only available when not using a global bank.
 
@@ -989,23 +926,37 @@ class Economy(commands.Cog):
         """
         guild = ctx.guild
         max_balance = await bank.get_max_balance(ctx.guild)
-        if creds <= 0 or creds > max_balance:
+        if creds >= max_balance:
             return await ctx.send(
-                _("Amount must be greater than zero and less than {maxbal}.").format(
-                    maxbal=humanize_number(max_balance)
-                )
+                _(
+                    "The bank requires that you set the payday to be less than"
+                    " its maximum balance of {maxbal}."
+                ).format(maxbal=humanize_number(max_balance))
             )
         credits_name = await bank.get_currency_name(guild)
         if await bank.is_global():
             await ctx.send(_("The bank must be per-server for per-role paydays to work."))
         else:
-            await self.config.role(role).PAYDAY_CREDITS.set(creds)
-            await ctx.send(
-                _(
-                    "Every payday will now give {num} {currency} "
-                    "to people with the role {role_name}."
-                ).format(num=humanize_number(creds), currency=credits_name, role_name=role.name)
-            )
+            if creds <= 0:  # Because I may as well...
+                default_creds = await self.config.guild(guild).PAYDAY_CREDITS()
+                await self.config.role(role).clear()
+                await ctx.send(
+                    _(
+                        "The payday value attached to role has been removed. "
+                        "Users with this role will now receive the default pay "
+                        "of {num} {currency}."
+                    ).format(num=humanize_number(default_creds), currency=credits_name)
+                )
+            else:
+                await self.config.role(role).PAYDAY_CREDITS.set(creds)
+                await ctx.send(
+                    _(
+                        "Every payday will now give {num} {currency} "
+                        "to people with the role {role_name}."
+                    ).format(
+                        num=humanize_number(creds), currency=credits_name, role_name=role.name
+                    )
+                )
 
     @economyset.command()
     async def registeramount(self, ctx: commands.Context, creds: int):

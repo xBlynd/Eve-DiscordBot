@@ -9,8 +9,9 @@ import lavalink
 
 from redbot.core import commands
 from redbot.core.i18n import Translator
+from redbot.core.utils._dpy_menus_utils import dpymenu
 from redbot.core.utils.chat_formatting import box, humanize_number, pagify
-from redbot.core.utils.menus import DEFAULT_CONTROLS, menu, start_adding_reactions
+from redbot.core.utils.menus import start_adding_reactions
 from redbot.core.utils.predicates import MessagePredicate, ReactionPredicate
 
 from ...equalizer import Equalizer
@@ -27,7 +28,13 @@ class EqualizerCommands(MixinMeta, metaclass=CompositeMetaClass):
     @commands.cooldown(1, 15, commands.BucketType.guild)
     @commands.bot_has_permissions(embed_links=True, add_reactions=True)
     async def command_equalizer(self, ctx: commands.Context):
-        """Equalizer management."""
+        """Equalizer management.
+
+        Band positions are 1-15 and values have a range of -0.25 to 1.0.
+        Band names are 25, 40, 63, 100, 160, 250, 400, 630, 1k, 1.6k, 2.5k, 4k,
+        6.3k, 10k, and 16k Hz.
+        Setting a band value to -0.25 nullifies it while +0.25 is double.
+        """
         if not self._player_check(ctx):
             ctx.command.reset_cooldown(ctx)
             return await self.send_embed_msg(ctx, title=_("Nothing playing."))
@@ -134,7 +141,7 @@ class EqualizerCommands(MixinMeta, metaclass=CompositeMetaClass):
                 text=_("{num} preset(s)").format(num=humanize_number(len(list(eq_presets.keys()))))
             )
             page_list.append(embed)
-        await menu(ctx, page_list, DEFAULT_CONTROLS)
+        await dpymenu(ctx, page_list)
 
     @command_equalizer.command(name="load")
     async def command_equalizer_load(self, ctx: commands.Context, eq_preset: str):
@@ -167,7 +174,7 @@ class EqualizerCommands(MixinMeta, metaclass=CompositeMetaClass):
                 title=_("Unable To Load Preset"),
                 description=_("You need the DJ role to load equalizer presets."),
             )
-
+        player.store("notify_channel", ctx.channel.id)
         await self.config.custom("EQUALIZER", ctx.guild.id).eq_bands.set(eq_values)
         await self._eq_check(ctx, player)
         eq = player.fetch("eq", Equalizer())
@@ -196,6 +203,7 @@ class EqualizerCommands(MixinMeta, metaclass=CompositeMetaClass):
                 description=_("You need the DJ role to reset the equalizer."),
             )
         player = lavalink.get_player(ctx.guild.id)
+        player.store("notify_channel", ctx.channel.id)
         eq = player.fetch("eq", Equalizer())
 
         for band in range(eq.band_count):
@@ -278,6 +286,7 @@ class EqualizerCommands(MixinMeta, metaclass=CompositeMetaClass):
                 return await eq_exists_msg.edit(embed=embed2)
 
         player = lavalink.get_player(ctx.guild.id)
+        player.store("notify_channel", ctx.channel.id)
         eq = player.fetch("eq", Equalizer())
         to_append = {eq_preset: {"author": ctx.author.id, "bands": eq.bands}}
         new_eq_presets = {**eq_presets, **to_append}
@@ -319,6 +328,7 @@ class EqualizerCommands(MixinMeta, metaclass=CompositeMetaClass):
             )
 
         player = lavalink.get_player(ctx.guild.id)
+        player.store("notify_channel", ctx.channel.id)
         band_names = [
             "25",
             "40",
